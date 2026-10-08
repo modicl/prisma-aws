@@ -1,0 +1,15 @@
+# Repo del espacio de trabajo: SOLO lo que no pertenece a ningún repo de servicio.
+# Lista blanca: todo lo demás (los repos anidados, .env, respaldos, planes de Terraform) queda fuera.
+/*
+!/.gitignore
+!/docker-compose.yml
+!/LOCAL.md
+!/.env.example
+!/local/
+!/docs/
+
+# Dentro de lo versionado
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/

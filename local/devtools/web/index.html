@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PRISMA devtools</title>
+<style>
+  /* Panel de desarrollo: tres paneles (ejecuciones, colas, Kafka) en una sola vista. Solo local. */
+  :root {
+    --bg: #f5f6f4; --surface: #ffffff; --ink: #1d2623; --muted: #5d6a66; --line: #d3dad6;
+    --ok: #1c7a4a; --run: #2563a8; --bad: #b3261e; --abort: #6b7370; --warn: #b45a00; --bar: #0b7a6b;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121816; --surface: #1a2220; --ink: #e4ebe8; --muted: #9aa8a3; --line: #34413d;
+      --ok: #4cc38a; --run: #6aa5e8; --bad: #f2726a; --abort: #9aa5a1; --warn: #e0a35a; --bar: #3fc7b0; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #121816; --surface: #1a2220; --ink: #e4ebe8; --muted: #9aa8a3; --line: #34413d;
+    --ok: #4cc38a; --run: #6aa5e8; --bad: #f2726a; --abort: #9aa5a1; --warn: #e0a35a; --bar: #3fc7b0; color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 system-ui, sans-serif; padding-inline: 16px; padding-block: 20px 40px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-bottom: 18px; }
+  h1 { font-size: 1.2rem; margin: 0; }
+  header small { color: var(--muted); }
+  button { font: inherit; padding: 4px 12px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 6px; cursor: pointer; }
+  button:focus-visible, select:focus-visible { outline: 2px solid var(--run); outline-offset: 2px; }
+  main { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); align-items: start; }
+  #panel-ejecuciones { grid-column: 1 / -1; }
+  section { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }
+  section h2 { font-size: .95rem; margin: 0 0 4px; }
+  .meta { color: var(--muted); font-size: .8rem; margin-bottom: 10px; }
+  .aviso { color: var(--warn); }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: .8rem; }
+  tr.sel { background: color-mix(in srgb, var(--run) 10%, transparent); }
+  tbody tr[data-name] { cursor: pointer; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: .75rem; font-weight: 600; border: 1px solid currentColor; }
+  .RUNNING, .running { color: var(--run); } .SUCCEEDED, .ok { color: var(--ok); } .FAILED, .TIMED_OUT, .failed { color: var(--bad); } .ABORTED, .aborted { color: var(--abort); }
+  .mono { font-family: var(--mono); font-size: .85em; }
+  .cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+  .card.dlq-con { border-color: var(--bad); }
+  .card h3 { font-size: .85rem; margin: 0 0 6px; word-break: break-all; }
+  .card dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0; font-variant-numeric: tabular-nums; }
+  .card dt { color: var(--muted); } .card dd { margin: 0; text-align: right; }
+  .linea { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+  .paso { display: grid; grid-template-columns: 170px 1fr 90px; gap: 10px; align-items: center; padding: 3px 0; }
+  .barra { height: 12px; background: var(--line); border-radius: 3px; position: relative; }
+  .barra i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--bar); border-radius: 3px; min-width: 3px; }
+  .paso.failed .barra i { background: var(--bad); } .paso.running .barra i { background: var(--run); } .paso.aborted .barra i { background: var(--abort); }
+  .error { grid-column: 1 / -1; color: var(--bad); font-size: .8rem; font-family: var(--mono); overflow-wrap: anywhere; }
+  .vacio { color: var(--muted); font-style: italic; }
+  @media (max-width: 560px) { .paso { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>PRISMA devtools</h1>
+  <small>solo desarrollo · solo lectura · se actualiza cada 3 s</small>
+  <button id="pausa" type="button">Pausar</button>
+  <label>Estado
+    <select id="filtro">
+      <option value="">todos</option><option>RUNNING</option><option>SUCCEEDED</option><option>FAILED</option><option>ABORTED</option>
+    </select>
+  </label>
+</header>
+
+<main>
+  <section id="panel-ejecuciones" aria-live="polite">
+    <h2>Ejecuciones de Step Functions</h2>
+    <div class="meta" id="meta-ejecuciones"></div>
+    <div class="scroll"><table>
+      <thead><tr><th>Sesión</th><th>Estado</th><th>Inicio</th><th>Duración</th></tr></thead>
+      <tbody id="filas-ejecuciones"></tbody>
+    </table></div>
+    <div class="linea" id="detalle" hidden></div>
+  </section>
+
+  <section id="panel-colas" aria-live="polite">
+    <h2>Colas SQS</h2>
+    <div class="meta" id="meta-colas"></div>
+    <div class="cards" id="tarjetas-colas"></div>
+  </section>
+
+  <section id="panel-kafka" aria-live="polite">
+    <h2>Kafka</h2>
+    <div class="meta" id="meta-kafka"></div>
+    <div class="scroll"><table>
+      <thead><tr><th>Tópico</th><th>Particiones</th><th>Mensajes</th></tr></thead>
+      <tbody id="filas-topicos"></tbody>
+    </table></div>
+    <div class="scroll" style="margin-top:10px"><table>
+      <thead><tr><th>Grupo</th><th>Tópico</th><th>Lag</th></tr></thead>
+      <tbody id="filas-grupos"></tbody>
+    </table></div>
+  </section>
+</main>
+
+<script>
+  // Regla de seguridad: los datos de la API se escriben SIEMPRE con textContent (nunca como HTML).
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, clase, texto) => {
+    const n = document.createElement(tag);
+    if (clase) n.className = clase;
+    if (texto !== undefined && texto !== null) n.textContent = texto;
+    return n;
+  };
+  const hora = (iso) => (iso ? new Date(iso).toLocaleTimeString() : '—');
+  const dur = (ms) => (ms == null ? '—' : ms < 1000 ? `${ms} ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.floor(ms / 60000)} min ${Math.round((ms % 60000) / 1000)} s`);
+  const nuevo = (padre, hijos) => { padre.replaceChildren(...hijos); };
+
+  let pausado = false;
+  let refrescando = false;     // sin esta guarda, si LocalStack tarda, las peticiones se acumulan y congelan todos los paneles
+  let seleccionada = null;
+
+  async function pedir(ruta) {
+    const r = await fetch(ruta);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  }
+
+  function meta(id, datos, extra) {
+    const m = $(id);
+    m.className = 'meta' + (datos.available === false ? ' aviso' : '');
+    m.textContent = datos.available === false
+      ? `no disponible: ${datos.error}`
+      : `actualizado ${new Date().toLocaleTimeString()}${extra ? ' · ' + extra : ''}`;
+  }
+
+  async function ejecuciones() {
+    const estado = $('filtro').value;
+    const d = await pedir('/api/executions' + (estado ? `?status=${encodeURIComponent(estado)}` : ''));
+    meta('meta-ejecuciones', d, d.note);
+    if (d.available === false) { nuevo($('filas-ejecuciones'), []); return; }
+    const filas = d.executions.map((e) => {
+      const tr = el('tr', e.name === seleccionada ? 'sel' : '');
+      tr.dataset.name = e.name;
+      tr.append(el('td', 'mono', e.name), el('td'), el('td', '', hora(e.start)), el('td', '', dur(e.duration_ms)));
+      tr.children[1].append(el('span', `pill ${e.status}`, e.status));
+      tr.addEventListener('click', () => { seleccionada = e.name; detalle(); ejecuciones(); });
+      return tr;
+    });
+    if (!filas.length) { const tr = el('tr'); const td = el('td', 'vacio', 'sin ejecuciones'); td.colSpan = 4; tr.append(td); filas.push(tr); }
+    nuevo($('filas-ejecuciones'), filas);
+  }
+
+  async function detalle() {
+    const caja = $('detalle');
+    if (!seleccionada) { caja.hidden = true; return; }
+    let d;
+    try { d = await pedir(`/api/executions/${encodeURIComponent(seleccionada)}`); }
+    catch (e) { caja.hidden = false; nuevo(caja, [el('div', 'vacio', 'esa ejecución ya no existe')]); return; }
+    caja.hidden = false;
+    if (d.available === false) { nuevo(caja, [el('div', 'aviso', `no disponible: ${d.error}`)]); return; }
+    const total = Math.max(1, ...d.steps.map((s) => s.duration_ms));
+    const cab = el('div', 'meta');
+    cab.append(el('span', `pill ${d.status}`, d.status), document.createTextNode(` ${d.name}`));
+    const pasos = d.steps.map((s) => {
+      const f = el('div', `paso ${s.status}`);
+      const nombre = el('div', 'mono', `${s.name}${s.attempt > 1 ? ' #' + s.attempt : ''}${s.retries ? ' · ' + s.retries + ' reintento(s)' : ''}`);
+      const barra = el('div', 'barra'); const i = el('i'); i.style.width = `${Math.max(1, (s.duration_ms / total) * 100)}%`; barra.append(i);
+      f.append(nombre, barra, el('div', 'mono', dur(s.duration_ms)));
+      if (s.error || s.cause) f.append(el('div', 'error', [s.error, s.cause].filter(Boolean).join(' — ')));
+      return f;
+    });
+    nuevo(caja, [cab, ...pasos]);
+  }
+
+  async function colas() {
+    const d = await pedir('/api/queues');
+    meta('meta-colas', d);
+    if (d.available === false) { nuevo($('tarjetas-colas'), []); return; }
+    const tarjetas = d.queues.map((q) => {
+      const c = el('div', 'card' + (q.is_dlq && q.visible > 0 ? ' dlq-con' : ''));
+      c.append(el('h3', '', q.name + (q.is_dlq ? ' (DLQ)' : '')));
+      const dl = el('dl');
+      [['pendientes', q.visible], ['en vuelo', q.in_flight], ['retrasados', q.delayed], ['DLQ', q.dlq || '—']].forEach(([k, v]) => dl.append(el('dt', '', k), el('dd', '', v)));
+      c.append(dl);
+      return c;
+    });
+    nuevo($('tarjetas-colas'), tarjetas.length ? tarjetas : [el('div', 'vacio', 'sin colas')]);
+  }
+
+  async function kafka() {
+    const d = await pedir('/api/kafka');
+    meta('meta-kafka', d);
+    if (d.available === false) { nuevo($('filas-topicos'), []); nuevo($('filas-grupos'), []); return; }
+    const fila = (...celdas) => { const tr = el('tr'); celdas.forEach((c) => tr.append(el('td', '', c))); return tr; };
+    nuevo($('filas-topicos'), d.topics.map((t) => fila(t.name, t.partitions, t.messages)));
+    nuevo($('filas-grupos'), d.groups.map((g) => fila(g.group, g.topic ?? '—', g.lag ?? '—')));
+  }
+
+  async function refrescar() {
+    if (pausado || refrescando) return;
+    refrescando = true;
+    try { await Promise.allSettled([ejecuciones(), colas(), kafka(), detalle()]); }
+    finally { refrescando = false; }
+  }
+
+  $('pausa').addEventListener('click', () => { pausado = !pausado; $('pausa').textContent = pausado ? 'Reanudar' : 'Pausar'; });
+  $('filtro').addEventListener('change', () => { pausado = false; $('pausa').textContent = 'Pausar'; refrescar(); });
+  refrescar();
+  setInterval(refrescar, 3000);
+</script>
+</body>
+</html>

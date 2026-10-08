@@ -1,0 +1,353 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# P.R.I.S.M.A. — entorno LOCAL completo (arquitectura actual, sin Kafka/RabbitMQ).
+#
+#   cp .env.example .env      # completa GOOGLE_API_KEY
+#   docker compose up -d --build
+#   http://localhost:3002
+#
+# Instrucciones, puertos y problemas conocidos: LOCAL.md
+#
+# Esto NO es lo que se despliega. Produccion corre en ECS/Fargate (prisma-infra).
+# Aqui cada servicio es su propio contenedor y se hablan por nombre de servicio.
+# ──────────────────────────────────────────────────────────────────────────────
+name: prisma
+
+networks:
+  default:
+    # Nombre fijo: LocalStack lo necesita para que el contenedor de la Lambda
+    # (LAMBDA_DOCKER_NETWORK) pueda alcanzar a `workflow`.
+    name: prisma-net
+
+volumes:
+  pgdata:
+  kafkadata:
+
+# ── Bloques reutilizables ────────────────────────────────────────────────────
+x-cognito: &cognito
+  # Deben coincidir con el pool del que el front emite el ID token.
+  COGNITO_REGION: ${COGNITO_REGION:-us-east-1}
+  COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID}
+  COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID}
+
+x-aws-local: &aws-local
+  # Credenciales falsas: LocalStack acepta cualquiera. NO son las de tu cuenta.
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+
+x-migrate: &migrate
+  restart: "no"
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ── Base de datos ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: prisma
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./local/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prisma -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ── AWS emulado: S3 + DynamoDB + Lambda ────────────────────────────────────
+  localstack:
+    image: localstack/localstack:${LOCALSTACK_TAG:-4.14.0}
+    environment:
+      SERVICES: s3,dynamodb,lambda,sqs,stepfunctions
+      LAMBDA_DOCKER_NETWORK: prisma-net
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
+      FLOW_MODE: ${FLOW_MODE:-sfn}           # sfn = SQS + Step Functions · legacy = S3 -> Lambda prisma-trigger -> /internal/run
+    volumes:
+      # El socket permite que LocalStack levante el contenedor de la Lambda.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./local/localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+      - ./prisma_workflow/lambda:/opt/lambda-src:ro
+      - ./prisma_workflow/statemachine:/opt/statemachine:ro
+    ports:
+      - "4566:4566"
+    healthcheck:
+      # Sano solo cuando init-aws.sh termino (buckets, tabla y Lambda ya existen).
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/init/ready | grep -q '\"completed\": true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  # ── Migraciones (one-shot). Ninguna imagen migra la BD por si sola. ─────────
+  # Se construyen con `target: builder` porque el CLI de Prisma vive en devDependencies
+  # y la imagen runtime no lo trae.
+  migrate-users:
+    <<: *migrate
+    build: { context: ./prisma-ms-users, target: builder }
+    command: npx prisma migrate deploy
+    environment:
+      DATABASE_URL: postgresql://prisma:${POSTGRES_PASSWORD}@postgres:5432/prisma_users
+
+  migrate-docs:
+    <<: *migrate
+    build: { context: ./prisma-ms-docs, target: builder }
+    command: npx prisma migrate deploy
+    environment:
+      DATABASE_URL: postgresql://prisma:${POSTGRES_PASSWORD}@postgres:5432/prisma_docs
+
+  migrate-perfil:
+    <<: *migrate
+    build: { context: ./prisma-ms-perfil-alumno, target: builder }
+    command: npx prisma migrate deploy
+    environment:
+      DATABASE_URL: postgresql://prisma:${POSTGRES_PASSWORD}@postgres:5432/prisma_perfil
+
+  # adminpanel NO tiene migracion baseline (su unica migracion es un ALTER sobre
+  # tablas que nunca se crearon con migrate), asi que `migrate deploy` fallaria en una
+  # base vacia. `db push` crea el esquema desde schema.prisma.
+  migrate-adminpanel:
+    <<: *migrate
+    build: { context: ./prisma-adminpanel, target: builder }
+    command: npx prisma db push --skip-generate
+    environment:
+      DATABASE_URL: postgresql://prisma:${POSTGRES_PASSWORD}@postgres:5432/prisma_adminpanel
+
+  # ── Microservicios ─────────────────────────────────────────────────────────
+  ms-users:
+    build: ./prisma-ms-users
+    depends_on:
+      migrate-users: { condition: service_completed_successfully }
+    environment:
+      <<: *cognito
+      PORT: 3001
+      CORS_ORIGIN: http://localhost:3002
+      DATABASE_URL: postgresql://prisma:${POSTGRES_PASSWORD}@postgres:5432/prisma_users
+      # Solo hacen falta para login/registro legacy y para que un admin cree usuarios
+      # (siguen pasando por Supabase). Vacios no impiden arrancar: se validan al usarlos.
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+    ports:
+      - "3001:3001"
+
+  ms-docs:
+    build: ./prisma-ms-docs
+    depends_on:
+      migrate-docs: { condition: service_completed_successfully }
+      localstack: { condition: service_healthy }
+    environment:
+      <<: [*cognito, *aws-local]
+      PORT: 3000
+      CORS_ORIGIN: http://localhost:3002
+      DATABASE_URL: postgresql://prisma:${POSTGRES_PASSWORD}@postgres:5432/prisma_docs
+      S3_BUCKET: prisma-workflow
+      AWS_S3_ENDPOINT: http://localstack:4566
+      # El navegador no resuelve `localstack`: las URLs prefirmadas de descarga se firman con una direccion alcanzable.
+      AWS_S3_PUBLIC_ENDPOINT: http://localhost:4566
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      DYNAMO_TABLE: chat_sessions
+      AWS_DYNAMODB_ENDPOINT: http://localstack:4566
+      CHAT_SESSION_DEFAULT_SCHOOL_ID: colegio_demo
+    ports:
+      - "3000:3000"
+
+  ms-perfil:
+    build: ./prisma-ms-perfil-alumno
+    depends_on:
+      migrate-perfil: { condition: service_completed_successfully }
+    environment:
+      <<: *cognito
+      PORT: 3005
+      CORS_ORIGIN: http://localhost:3002
+      DATABASE_URL: postgresql://prisma:${POSTGRES_PASSWORD}@postgres:5432/prisma_perfil
+    ports:
+      - "3005:3005"
+
+  adminpanel:
+    build: ./prisma-adminpanel
+    depends_on:
+      migrate-adminpanel: { condition: service_completed_successfully }
+    environment:
+      PORT: 3004
+      CORS_ORIGIN: http://localhost:3002
+      DATABASE_URL: postgresql://prisma:${POSTGRES_PASSWORD}@postgres:5432/prisma_adminpanel
+      # OJO: en adminpanel USERS_SERVICE_URL lleva /api; DOCS_SERVICE_URL no.
+      USERS_SERVICE_URL: http://ms-users:3001/api
+      DOCS_SERVICE_URL: http://ms-docs:3000
+    ports:
+      - "3004:3004"
+
+  # ── BFF ────────────────────────────────────────────────────────────────────
+  bff:
+    build: ./bff-prisma
+    depends_on:
+      - ms-users
+      - ms-docs
+      - ms-perfil
+      - adminpanel
+    environment:
+      # El Dockerfile del BFF trae PORT=3006; el puerto real del sistema es 3010.
+      PORT: 3010
+      CORS_ORIGIN: http://localhost:3002
+      USERS_SERVICE_URL: http://ms-users:3001
+      ADMINPANEL_SERVICE_URL: http://adminpanel:3004
+      PERFIL_SERVICE_URL: http://ms-perfil:3005
+      DOCS_SERVICE_URL: http://ms-docs:3000
+    ports:
+      - "3010:3010"
+
+  # ── Motor de IA ────────────────────────────────────────────────────────────
+  workflow:
+    build: ./prisma_workflow
+    depends_on:
+      localstack: { condition: service_healthy }
+    environment:
+      <<: [*cognito, *aws-local]
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GOOGLE_GENAI_USE_VERTEXAI: "0"
+      # boto3 >= 1.28 lee AWS_ENDPOINT_URL: apunta S3 y DynamoDB a LocalStack sin tocar codigo.
+      AWS_ENDPOINT_URL: http://localstack:4566
+      # Ambos seteados => flujo event-driven real: /chat/start sube a S3 y la Lambda
+      # (emulada por LocalStack) dispara /chat/internal/run.
+      S3_BUCKET: prisma-workflow
+      S3_PUBLIC_ENDPOINT_URL: http://localhost:4566   # solo local: URLs prefirmadas de descarga alcanzables desde el navegador
+      DYNAMO_TABLE: chat_sessions
+      S3_BUCKET_NAME: prisma-schools-repos
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+      # Vacio => sesiones ADK en memoria y sin tracking de tokens en Postgres.
+      BD_LOGS: ""
+      # Monitor en vivo. El workflow NO depende de Kafka: si no esta arriba, descarta eventos y sigue.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: prisma.agent-events
+      # Step Functions (LocalStack): el workflow completa las tareas con SendTaskSuccess.
+      SFN_STATE_MACHINE_ARN: arn:aws:states:us-east-1:000000000000:stateMachine:prisma-flujo
+      PHASE_HEARTBEAT_SECONDS: "2"           # heartbeat corto: las pruebas con worker muerto no tardan minutos
+      MOCK_PHASE_DELAY: "0.3"
+    volumes:
+      - ./local/e2e:/e2e:ro
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # ── Monitor en vivo: Kafka + prisma-monitor ────────────────────────────────
+  kafka:
+    image: apache/kafka:${KAFKA_TAG:-4.2.2}
+    environment:
+      # Un solo nodo KRaft (broker + controller), sin ZooKeeper. Solo para desarrollo local.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      # 9092: red interna del compose (workflow, monitor). 9094: tu maquina (herramientas locales).
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # El topic lo crea kafka-init con sus particiones y retencion; nada se crea "por accidente".
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    ports:
+      - "9094:9094"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-init:
+    image: apache/kafka:${KAFKA_TAG:-4.2.2}
+    restart: "no"
+    depends_on:
+      kafka: { condition: service_healthy }
+    # 3 particiones: la clave es el session_id, asi que los eventos de un flujo siempre caen en la
+    # misma y conservan el orden. Retencion 7 dias (604800000 ms).
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists
+        --topic prisma.agent-events --partitions 3 --replication-factor 1
+        --config retention.ms=604800000
+
+  # Crea la base del respaldo si no existe. init.sql solo corre al crear el volumen, asi que en un
+  # Postgres ya existente esta base no estaria; este paso es idempotente.
+  db-monitor-init:
+    image: postgres:16-alpine
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        psql -h postgres -U prisma -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='prisma_monitor'" | grep -q 1
+        || psql -h postgres -U prisma -d postgres -c "CREATE DATABASE prisma_monitor"
+
+  monitor:
+    build: ./prisma-monitor
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      db-monitor-init: { condition: service_completed_successfully }
+    environment:
+      <<: *cognito
+      PORT: 3020
+      COGNITO_DOMAIN: ${COGNITO_DOMAIN}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: prisma.agent-events
+      MONITOR_DATABASE_URL: postgresql://prisma:${POSTGRES_PASSWORD}@postgres:5432/prisma_monitor
+      # Tarifas USD por millon de tokens (JSON). Vacio/{} => el costo se muestra "sin tarifa".
+      MODEL_PRICES: ${MODEL_PRICES:-}
+      STALL_MINUTES: ${STALL_MINUTES:-30}
+    ports:
+      - "3020:3020"
+
+  # ── Panel de desarrollo: Step Functions, SQS y Kafka (solo lectura, solo local) ──
+  devtools:
+    build: ./local/devtools
+    depends_on:
+      localstack: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    environment:
+      PORT: 3030
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test           # falsas, como el resto del compose
+      AWS_SECRET_ACCESS_KEY: test
+      SFN_STATE_MACHINE_ARN: arn:aws:states:us-east-1:000000000000:stateMachine:prisma-flujo
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    ports:
+      - "127.0.0.1:3030:3030"
+
+  # ── Front (nginx = puerta unica: /api -> bff, /chat -> workflow) ───────────
+  front:
+    build:
+      context: ./prisma-front
+      dockerfile: ../local/front.Dockerfile
+      args:
+        VITE_COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID}
+        VITE_COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID}
+        VITE_COGNITO_DOMAIN: ${COGNITO_DOMAIN}
+    depends_on:
+      - bff
+      - workflow
+    ports:
+      # 3002 es el puerto registrado en las callback URLs del pool de Cognito.
+      - "3002:80"
